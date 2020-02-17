@@ -771,6 +771,9 @@ static void es_hw_device_release(struct  device *dev)
     return;
 }
 
+#define AES_PA_BASE     AES_FTAES020_PA_BASE
+#define AES_PA_LIMIT    AES_FTAES020_PA_LIMIT
+#define AES_0_IRQ       AES_FTAES020_0_IRQ
 static struct resource es_hw_resource[] = 
 {
     [0] = {
