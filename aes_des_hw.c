@@ -28,7 +28,10 @@
 #include "aes_des_hw.h"
 #include <mach/fmem.h>
 #include "frammap_if.h"
-
+#include <linux/poll.h>
+#include <linux/cdev.h>
+#include <linux/platform_device.h>
+#include <mach/ftpmu010.h> 
 
 #define ALLOC_DMA_BUF_CACHED
 #define SUPPORT_HOST_CANCEL
@@ -39,7 +42,8 @@
 
 // the number of device file will be connect to struct cdev
 #define COUNT                       1
-#define DEVICE_FILE_NAME            aes_des_hw
+#define DEVICE_FILE_NAME            "aes_des_hw"
+#define CLASS_NAME                  "aes_des_sc"
 
 #define SIZE_1K             (1  << 10)
 #define SIZE_64K            (64 << 10)
@@ -48,22 +52,22 @@
 #define SIZE_4M             (4  << 20)
 
 static dev_t    dev_num;
-static struct device  *_device = NULL;
+struct device  *device = NULL;
 static struct class   *cls = NULL;
 static struct cdev    *my_cdev = NULL;
 
 
-static struct aes_des_data
+typedef struct aes_des_data
 {
     void *dma_addr_va; // virtual address
     dma_addr_t *dma_addr_pa; // physical address
     int dma_map_size;
     int share_mem_size;
-};
+}AES_DES_DATA;
 
 void __iomem *aes_base_addr_va = NULL;
-struct resource *irq; = NULL;
-sttic wait_queue_head_t aes_wq;
+struct resource *irq = NULL;
+static wait_queue_head_t aes_wq;
 
 static volatile int dma_int_ok;
 static struct semaphore  sema;
@@ -71,7 +75,7 @@ static unsigned int exit_for_cancel = 0;
 
 // function to read from register
 
-static inline int aaes_read_reg(int offset)
+static inline int aes_read_reg(int offset)
 {
     return ioread32(aes_base_addr_va + offset);
 }
@@ -82,10 +86,15 @@ static inline void aes_write_reg(int offset, int value)
     iowrite32(value, aes_base_addr_va + offset);
 }
 
+unsigned int es_va2pa(u32 vaddr)
+{
+    return (unsigned int)frm_va2pa(vaddr);
+}
+
 static irqreturn_t aes_hw_irq_handler(int irq, void *devid)
 {
     int status;
-    status = aaes_read_reg(SEC_MaskedIntrStatus);
+    status = aes_read_reg(SEC_MaskedIntrStatus);
     if ((status & Data_done) != 0) 
     {
         dma_int_ok = 1;
@@ -126,7 +135,7 @@ static int alloc_share_mem(struct aes_des_data *p_data, int size)
         return -ENOMEM;
     }
     p_data->dma_addr_va =  page_address(p_page); // get virtual addr
-    p_data->dma_addr_pa = page_to_phys(p_page); // get physical addr
+    p_data->dma_addr_pa = (dma_addr_t *)page_to_phys(p_page); // get physical addr
     p_data->share_mem_size = size;
 
 #else
@@ -145,7 +154,7 @@ static void free_share_mem(struct aes_des_data *p_data)
     if(!p_data)
     {
         printk(KERN_ERR "invalid input\n");
-        return -EINVAL;
+        return;
     }
 
     if(p_data->dma_addr_va)
@@ -163,19 +172,20 @@ static void free_share_mem(struct aes_des_data *p_data)
 static int es_hw_open(struct inode *inode, struct file *filp)
 {
     // @TODO: allocate memory which will be to user space
+    int retval;
     struct aes_des_data *p_data = kzalloc(sizeof(struct aes_des_data), GFP_KERNEL);
-    if(!aes_des_data)
+    if(!p_data)
     {
         printk(KERN_ERR "unable to allocate mem for aes_des_data\n");
         return -ENOMEM;
     }
     
-    retval = alloc_share_mem(p_data);
+    retval = alloc_share_mem(p_data, SIZE_4M);
     if(retval < 0)
     {
         printk(KERN_ERR "unable to allocate share mem\n");
     }
-    file->private_data = p_data;
+    filp->private_data = p_data;
     return 0;
 }
 
@@ -209,7 +219,7 @@ static int es_hw_mmap(struct file *filp, struct vm_area_struct *vma)
     // check input from user space
     if(!(vma->vm_flags & VM_WRITE))
     {
-        PRINTK(KERN_ERR "app bug: PROT_WRITE please\n");
+        printk(KERN_ERR "app bug: PROT_WRITE please\n");
         return -EINVAL;
     }
 
@@ -222,7 +232,7 @@ static int es_hw_mmap(struct file *filp, struct vm_area_struct *vma)
     if(!(p_data->dma_addr_pa))
     {
         retval = alloc_share_mem(p_data, SIZE_4M);
-        if(ret < 0)
+        if(retval < 0)
         {
             printk(KERN_ERR "unable to allocate share mem\n");
             return -ENOMEM; 
@@ -251,10 +261,10 @@ static int es_hw_mmap(struct file *filp, struct vm_area_struct *vma)
     vma->vm_flags |= VM_RESERVED;
 
     // identify pfn
-    pfn = vir_to_phys(p_data->dma_addr_va + offset) >> PAGE_SHIFT;
+    pfn = virt_to_phys(p_data->dma_addr_va + offset) >> PAGE_SHIFT;
 
     // proceed to remap mem
-    if(remap_pfn_range(vma, vma->vm_start, pfn, p_data->dma_map_size), vma->vm_page_prot)
+    if(remap_pfn_range(vma, vma->vm_start, pfn, p_data->dma_map_size, vma->vm_page_prot))
     {
         printk(KERN_ERR "remap mem failed\n");
         free_share_mem(p_data);
@@ -315,6 +325,20 @@ static void IV_Output(int addr)
       //printk("IV = 0x%08x\n",*(u32 *)(addr + 4 * i));
     }
 }
+
+static u32 random(void)
+{
+    static int first_geg = 1;
+    static u32 rand = 0;
+    if (first_geg == 1) {
+        rand = jiffies;
+        first_geg = 0;
+    }
+    rand = (rand*0x1664525) + 0x13904223;
+
+    return rand;
+}
+
 
 static int getkey(int algorithm, u32 key_addr, u32 IV_addr, u32 data)
 {
@@ -401,7 +425,7 @@ int es_wait_event_on(void)
 }
 
 
-static int es_do_dma(int stage, esreq * srq, struct sec_file_data* p_data )
+static int es_do_dma(int stage, esreq * srq, struct aes_des_data* p_data )
 {
     int i, ret = 0;
     unsigned int section;
@@ -581,7 +605,7 @@ static long es_hw_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
             if (status)
                 goto exit_err;
 
-            IV_Output((int)DMA_INFO_VA(p_data) + srq.data_length - 16);
+            IV_Output((int)p_data->dma_addr_va + srq.data_length - 16);
             break;
 
         default:
@@ -604,30 +628,30 @@ exit_err:
 
 static unsigned int es_hw_poll(struct file *filp, struct poll_table_struct *pwait)
 {
-    unsigned int mask;
+    unsigned int mask = 0x00;
     mask |= POLLIN | POLLRDNORM;
     return mask;
 }
 
-static size_t es_hw_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos)
+static ssize_t es_hw_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos)
 {
     return count;
 }
 
-static size_t es_hw_write(struct file *filp, char __user *buf, size_t count, loff_t *f_pos)
+static ssize_t es_hw_write(struct file *filp, const char __user *buf, size_t count, loff_t *f_pos)
 {
     return count;
 }
 
-static struct file_operation es_hw_fops = {
-    owner:THIS_MODULE,
-    unlocked_ioctl:es_hw_ioctl,
-    mmap:es_hw_mmap,
-    open:es_hw_open,
-    release:es_hw_release,
-    read:es_hw_read,
-    write:es_hw_write,
-    poll:es_hw_poll,
+static const struct file_operations es_hw_fops = {
+    .owner               =       THIS_MODULE,
+    .unlocked_ioctl      =       es_hw_ioctl,
+    .mmap                =       es_hw_mmap,
+    .open                =       es_hw_open,
+    .release             =       es_hw_release,
+    .read                =       es_hw_read,
+    .write               =       es_hw_write,
+    .poll                =       es_hw_poll,
 };
 
 static int es_hw_probe(struct platform_device *pdev)
@@ -652,8 +676,8 @@ static int es_hw_probe(struct platform_device *pdev)
     }
 
     // create device file
-    _device = device_create(cls, NULL, dev_num, NULL, DEVICE_FILE_NAME%d, MINOR(dev_num));
-    if(IS_ERR(_device))
+    device = device_create(cls, NULL, dev_num, NULL, DEVICE_FILE_NAME"%d", MINOR(dev_num));
+    if(IS_ERR(device))
     {
         printk(KERN_ERR "failed to create device file\n");
         goto __FAILED_CREATE_DEVICE_FILE;
@@ -683,7 +707,7 @@ static int es_hw_probe(struct platform_device *pdev)
 
     // get resource 
     mem = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-    (!mem)
+    if(!mem)
     {
         printk(KERN_ERR "no mem resource\n");
         retval = -ENODEV;
@@ -700,14 +724,14 @@ static int es_hw_probe(struct platform_device *pdev)
     }
 
     irq = platform_get_resource(pdev, IORESOURCE_IRQ, 0);
-    (!irq)
+    if(!irq)
     {
         printk(KERN_ERR "no irq resource\n");
         retval = -ENODEV;
         goto __FAILED_GET_RESOURCE_IRQ;
     }
     
-    retval = request_irq(irq->start, aes_hw_irq_handler, NULL, dev_name(&pdev->dev), pdev);
+    retval = request_irq(irq->start, aes_hw_irq_handler, IRQF_DISABLED, dev_name(&pdev->dev), NULL);
     if(retval)
     {
         printk(KERN_ERR "request_irq failed\n");
@@ -751,7 +775,7 @@ static int __devexit es_hw_remove(struct platform_device *pdev)
     device_destroy(cls, dev_num);
     class_destroy(cls);
     unregister_chrdev_region(dev_num, NUMBER_OF_DEVICE_NUMBER);
-    ioremap((void __iomem *)aes_base_addr_va);
+    iounmap((void __iomem *)aes_base_addr_va);
     free_irq(irq->start, NULL);
     return 0;
 }
@@ -763,10 +787,10 @@ static struct platform_driver es_hw_driver = {
     },
     .probe = es_hw_probe,
     .remove = __devexit_p(es_hw_remove),
-}
+};
 
 
-static void es_hw_device_release(struct  device *dev)
+static void aes_hw_device_release(struct  device *dev)
 {
     return;
 }
@@ -788,6 +812,7 @@ static struct resource es_hw_resource[] =
     }
 };
 
+static u64 es_hw_do_dmamask = 0xFFFFFFUL;
 static struct platform_device es_hw_device = {
     .name   =   DEVICE_NAME,
     .id     =   -1,
@@ -796,7 +821,7 @@ static struct platform_device es_hw_device = {
     .dev    = {
         .dma_mask   = &es_hw_do_dmamask,
         .coherent_dma_mask = 0xFFFFFFFF,
-        .release = es_hw_device_release,
+        .release = aes_hw_device_release,
     },
 };
 
@@ -839,7 +864,7 @@ int platform_pmu_exit(void)
 
     return 0;
 }
-static int __init ae_hw_init(void)
+static int __init aes_hw_init(void)
 {
     // init clock related 
     platform_pmu_init();
@@ -848,7 +873,7 @@ static int __init ae_hw_init(void)
     return 0;
 }
 
-static void __exit es_hw_exit(void)
+static void __exit aes_hw_exit(void)
 {
     // release clock related
     platform_pmu_exit();
@@ -856,8 +881,8 @@ static void __exit es_hw_exit(void)
     platform_device_unregister(&es_hw_device);
 }
 
-module_init(es_hw_init);
-module_exit(es_hw_exit);
+module_init(aes_hw_init);
+module_exit(aes_hw_exit);
 
 
 MODULE_DESCRIPTION("security driver");
